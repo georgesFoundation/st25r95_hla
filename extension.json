@@ -1,0 +1,13 @@
+{
+  "name": "ST25R95 (SPI)",
+  "apiVersion": "1.0.0",
+  "author": "Georges Palauqui (georges@foundation.xyz)",
+  "version": "1.0.0",
+  "description": "High Level Analyzer for STMicroelectronics ST25R95 NFC chip on SPI bus",
+  "extensions": {
+    "ST25R95 (SPI)": {
+      "type": "HighLevelAnalyzer",
+      "entryPoint": "st_st25r95.Hla"
+    }
+  }
+}
