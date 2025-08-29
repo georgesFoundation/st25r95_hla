@@ -42,7 +42,6 @@ RESPONSE_CODE = {
     0x66: 'ETr1 Too Big',
     0x67: 'ETr1 Too Small',
     0x68: 'EinternalError',
-    0x80: 'EFrameRecvOK',
     0x82: 'EInvalidCmdLen',
     0x83: 'EInvalidProto',
     0x85: 'EUserStop',
@@ -56,6 +55,10 @@ RESPONSE_CODE = {
     0x8D: 'ECrcError',
     0x8E: 'ERecvLost',
     0x8F: 'ENoField',
+}
+# these response codes can contain 2 bits of data_len
+RESPONSE_CODE_LEN = {
+    0x80: 'EFrameRecvOK',
     0x90: 'EUnintByte',
 }
 
@@ -78,18 +81,22 @@ REGISTER = {
 class Hla(HighLevelAnalyzer):
     
     def __init__(self):
-        state = ST25R95_DECODER_STATE.START
+        self.state = ST25R95_DECODER_STATE.START
+        self.selected_protocol = 'Field OFF'
         
     def decode(self, frame: AnalyzerFrame):
         if frame.type == 'enable':
             self.state = ST25R95_DECODER_STATE.GET_CONTROL_BYTE
             self.begin_frame = frame.start_time
             self.data_len = 0
+            self.data_cnt = 0
         elif frame.type == 'result':
             mosi = int.from_bytes(frame.data['mosi'], 'big')
             miso = int.from_bytes(frame.data['miso'], 'big')
             if self.state == ST25R95_DECODER_STATE.GET_CONTROL_BYTE:
                 self.data = ''
+                self.flags = '{0:#0{1}x}'.format(miso, 4)
+                self.send = True
                 if mosi == 0x01:
                     self.type = ST25R95_TYPE.Reset
                 elif mosi == 0x03:
@@ -98,7 +105,6 @@ class Hla(HighLevelAnalyzer):
                 elif mosi == 0x00:
                     self.type = ST25R95_TYPE.Send_Command
                     self.state = ST25R95_DECODER_STATE.GET_CMD
-                    self.send = True
                 elif mosi == 0x02:
                     self.type = ST25R95_TYPE.Read_Data
                     self.state = ST25R95_DECODER_STATE.GET_RESP_CODE
@@ -106,36 +112,53 @@ class Hla(HighLevelAnalyzer):
                 else:
                     self.type = ST25R95_TYPE.Unk
             elif self.state == ST25R95_DECODER_STATE.GET_POLL:
-                self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
+                self.data += '{0:#0{1}x}'.format(miso, 4) + ' '
             elif self.state == ST25R95_DECODER_STATE.GET_CMD:
                 self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
                 self.cmd_resp = COMMAND_CODE.get(mosi, '?')
                 self.state = ST25R95_DECODER_STATE.GET_LEN
             elif self.state == ST25R95_DECODER_STATE.GET_RESP_CODE:
                 self.data += '{0:#0{1}x}'.format(miso, 4) + ' '
-                self.cmd_resp = RESPONSE_CODE.get(miso, '?')
+                self.cmd_resp = RESPONSE_CODE.get(miso, RESPONSE_CODE_LEN.get(miso & 0x9F, '?'))
+                self.data_len = (miso & 0x60) << 3 if (self.cmd_resp == 'EFrameRecvOK' and self.cmd_resp == 'EUnintByte') else 0
                 self.state = ST25R95_DECODER_STATE.GET_LEN
             elif self.state == ST25R95_DECODER_STATE.GET_LEN:
-                self.data_len = mosi if self.send else miso
+                self.data_len += mosi if self.send else miso
                 self.data += '{0:#0{1}x}'.format(self.data_len, 4) + ' '
                 self.state = ST25R95_DECODER_STATE.GET_REG if (self.cmd_resp == 'WrReg' or self.cmd_resp == 'RdReg') else ST25R95_DECODER_STATE.GET_PROTOCOL if self.cmd_resp == 'ProtocolSelect' else ST25R95_DECODER_STATE.GET_DATA
             elif self.state == ST25R95_DECODER_STATE.GET_PROTOCOL:
                 self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
-                self.cmd_resp += '(' + PROTOCOL.get(mosi, '?') + ')'
+                self.data_cnt += 1
+                self.selected_protocol = PROTOCOL.get(mosi, '?')
+                self.cmd_resp += '(' + self.selected_protocol + ')'
                 self.state = ST25R95_DECODER_STATE.GET_DATA
             elif self.state == ST25R95_DECODER_STATE.GET_REG:
                 self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
+                self.data_cnt += 1
                 self.cmd_resp += '(' + REGISTER.get(mosi, '?') + ')'
                 self.state = ST25R95_DECODER_STATE.GET_DATA
             elif self.state == ST25R95_DECODER_STATE.GET_DATA:
                 self.data += '{0:#0{1}x}'.format(mosi if self.send else miso, 4) + ' '
+                self.data_cnt += 1
         elif frame.type == 'disable':
             self.state = ST25R95_DECODER_STATE.START
+            bugs = ''
+            if self.data_len > self.data_cnt:
+                bugs += '[frame aborted, missing data] '
+            if self.selected_protocol == 'ISO/IEC 14443-B' and self.data_len > 528:
+                bugs += '[Max data_len of 528 bytes exceded] '
+            if self.selected_protocol == 'ISO/IEC 14443-A' and self.data_len > 256:
+                bugs += '[Max data_len of 256 bytes exceded] '
             if (self.type == ST25R95_TYPE.Send_Command) or (self.type == ST25R95_TYPE.Read_Data):
                 return AnalyzerFrame(self.type.name, self.begin_frame, frame.end_time, {
                     'cmd/resp': self.cmd_resp,
                     'len': f'{self.data_len}',
-                    'data': self.data
+                    'data': self.data,
+                    'flags': self.flags,
+                    'bugs': bugs
                 }) 
             else:
-                return AnalyzerFrame(self.type.name, self.begin_frame, frame.end_time, {})  
+                return AnalyzerFrame(self.type.name, self.begin_frame, frame.end_time, {
+                    'data': self.data,                                                                      
+                    'flags': self.flags
+                })  
