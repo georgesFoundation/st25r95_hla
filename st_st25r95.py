@@ -68,6 +68,7 @@ PROTOCOL = {
     0x02: 'ISO/IEC 14443-A',
     0x03: 'ISO/IEC 14443-B',
     0x04: 'FeliCa',
+    0x12: 'ISO/IEC 14443-A CE',
 }
 
 REGISTER = {
@@ -78,11 +79,34 @@ REGISTER = {
     0x69: 'Wakeup Event',
 }
 
+def tx_flag(raw: int) -> str:
+    flag = '('
+    if raw & 0x80 == 0x80:
+        flag += 'Topaz | '
+    if raw & 0x40 == 0x40:
+        flag += 'Split | '
+    if raw & 0x20 == 0x20:
+        flag += 'Append CRC | '
+    if raw & 0x10 == 0x10:
+        flag += 'Parity Framing mode | '
+    flag += f"{raw&0xf} significant bits in last byte)"
+    return flag
+
+def rx_flag(raw: int) -> str:
+    flag = '('
+    if raw & 0x20 == 0x20:
+        flag += 'CRC error | '
+    if raw & 0x10 == 0x10:
+        flag += 'Parity error | '
+    flag += f"{raw&0xf} significant bits in last byte)"
+    return flag
+
 class Hla(HighLevelAnalyzer):
     
     def __init__(self):
         self.state = ST25R95_DECODER_STATE.START
         self.selected_protocol = 'Field OFF'
+        self.last_command = ''
         
     def decode(self, frame: AnalyzerFrame):
         if frame.type == 'enable':
@@ -95,6 +119,7 @@ class Hla(HighLevelAnalyzer):
             miso = int.from_bytes(frame.data['miso'], 'big')
             if self.state == ST25R95_DECODER_STATE.GET_CONTROL_BYTE:
                 self.data = ''
+                self.protocol = ''
                 self.flags = '{0:#0{1}x}'.format(miso, 4)
                 self.send = True
                 if mosi == 0x01:
@@ -115,7 +140,8 @@ class Hla(HighLevelAnalyzer):
                 self.data += '{0:#0{1}x}'.format(miso, 4) + ' '
             elif self.state == ST25R95_DECODER_STATE.GET_CMD:
                 self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
-                self.cmd_resp = COMMAND_CODE.get(mosi, '?')
+                self.last_command = COMMAND_CODE.get(mosi, '?')
+                self.cmd_resp = self.last_command
                 self.state = ST25R95_DECODER_STATE.GET_LEN
             elif self.state == ST25R95_DECODER_STATE.GET_RESP_CODE:
                 self.data += '{0:#0{1}x}'.format(miso, 4) + ' '
@@ -140,10 +166,22 @@ class Hla(HighLevelAnalyzer):
             elif self.state == ST25R95_DECODER_STATE.GET_DATA:
                 self.data += '{0:#0{1}x}'.format(mosi if self.send else miso, 4) + ' '
                 self.data_cnt += 1
+                if self.last_command == 'PollField':
+                    self.cmd_resp += ' (No RF field detected)' if self.data_len == 0 or miso == 0 else ' (RF field detected)'
+                elif (self.last_command == 'Listen' or self.last_command == 'SendRecv') and self.cmd_resp == 'EFrameRecvOK':
+                    if self.data_len == self.data_cnt and (self.selected_protocol == 'ISO/IEC 14443-A' or self.selected_protocol == 'ISO/IEC 14443-A CE'):
+                        self.protocol += rx_flag(miso)                                                                                                  
+                    else:
+                        self.protocol += '{0:#0{1}x}'.format(miso, 4) + ' '
+                elif self.last_command == 'Send' or self.last_command == 'SendRecv':
+                    if self.data_len == self.data_cnt and (self.selected_protocol == 'ISO/IEC 14443-A' or self.selected_protocol == 'ISO/IEC 14443-A CE'):
+                        self.protocol += tx_flag(mosi)
+                    else:
+                        self.protocol += '{0:#0{1}x}'.format(mosi, 4) + ' '
         elif frame.type == 'disable':
             self.state = ST25R95_DECODER_STATE.START
             bugs = ''
-            if self.data_len > self.data_cnt:
+            if self.data_len > self.data_cnt and self.last_command != 'Echo':
                 bugs += '[frame aborted, missing data] '
             if self.selected_protocol == 'ISO/IEC 14443-B' and self.data_len > 528:
                 bugs += '[Max data_len of 528 bytes exceded] '
@@ -154,6 +192,7 @@ class Hla(HighLevelAnalyzer):
                     'cmd/resp': self.cmd_resp,
                     'len': f'{self.data_len}',
                     'data': self.data,
+                    'protocol': self.protocol,
                     'flags': self.flags,
                     'bugs': bugs
                 }) 
