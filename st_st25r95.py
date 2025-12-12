@@ -79,6 +79,15 @@ REGISTER = {
     0x69: 'Wakeup Event',
 }
 
+AC_STATE = {
+    0x00: 'Idle',
+    0x01: 'Readya',
+    0x04: 'Active',
+    0x80: 'Halt',
+    0x81: 'ReadyA*',
+    0x84: 'Active*',
+}
+
 def tx_flag(raw: int) -> str:
     flag = '('
     if raw & 0x80 == 0x80:
@@ -100,6 +109,15 @@ def rx_flag(raw: int) -> str:
         flag += 'Parity error | '
     flag += f"{raw&0xf} significant bits in last byte)"
     return flag
+
+def ac_state(raw: int) -> str:
+    state = ''
+    if raw & 0x20 == 0x20:
+        state += 'CRC error | '
+    if raw & 0x10 == 0x10:
+        state += 'Parity error | '
+    state += f"{raw&0xf} significant bits in last byte)"
+    return state
 
 class Hla(HighLevelAnalyzer):
     
@@ -168,9 +186,19 @@ class Hla(HighLevelAnalyzer):
                 self.data_cnt += 1
                 if self.last_command == 'PollField':
                     self.cmd_resp += ' (No RF field detected)' if self.data_len == 0 or miso == 0 else ' (RF field detected)'
-                elif (self.last_command == 'Listen' or self.last_command == 'SendRecv') and self.cmd_resp == 'EFrameRecvOK':
-                    if self.data_len == self.data_cnt and (self.selected_protocol == 'ISO/IEC 14443-A' or self.selected_protocol == 'ISO/IEC 14443-A CE'):
-                        self.protocol += rx_flag(miso)                                                                                                  
+                elif self.last_command == 'AC filter':
+                    if self.data_len == 2 and self.data_cnt == 1:
+                        self.cmd_resp += ' (Get AC State)'
+                    elif self.data_len == 1:
+                        if self.send:
+                            self.cmd_resp += ' (Set AC State: ' + AC_STATE.get(mosi, '?') + ')'
+                        else:
+                            self.cmd_resp += ' (AC State: ' + AC_STATE.get(miso, '?') + ')'
+                    elif self.data_len == 0:
+                        self.cmd_resp += ' (Disable AC Filter)'
+                elif (self.last_command == 'Listen' or self.last_command == 'SendRecv') and (self.cmd_resp == 'EFrameRecvOK' or self.cmd_resp == 'EUnintByte' or self.cmd_resp == 'EFrameWaitTOut'):
+                    if ((self.data_len == self.data_cnt + 2 and self.selected_protocol == 'ISO/IEC 14443-A') or (self.data_len == self.data_cnt and self.selected_protocol == 'ISO/IEC 14443-A CE')) and (self.cmd_resp == 'EFrameRecvOK' or self.cmd_resp == 'EUnintByte'):
+                        self.protocol += rx_flag(miso)
                     else:
                         self.protocol += '{0:#0{1}x}'.format(miso, 4) + ' '
                 elif self.last_command == 'Send' or self.last_command == 'SendRecv':
