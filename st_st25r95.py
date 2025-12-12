@@ -11,6 +11,14 @@ class ST25R95_DECODER_STATE(Enum):
     GET_DATA = 6
     GET_PROTOCOL = 7
     GET_REG = 8
+    GET_IDLE_WU_SOURCE = 9
+    GET_IDLE_ENTER_CTRL = 10
+    GET_IDLE_WU_CTRL = 11
+    GET_IDLE_LEAVE_CTRL = 12
+    GET_IDLE_TIMING = 13
+    GET_IDLE_DAC_DATA = 14
+    GET_IDLE_PARAMS = 15
+    GET_IDLE_RESP = 16
     
 class ST25R95_TYPE(Enum):
     Send_Command = 0
@@ -88,6 +96,36 @@ AC_STATE = {
     0x84: 'Active*',
 }
 
+# Idle command constants
+LFO_FREQ = {
+    0b00: '32kHz',
+    0b01: '16kHz',
+    0b10: '8kHz',
+    0b11: '4kHz'
+}
+
+# Control/Resume configuration bit descriptions
+CTRL_RES_BITS = {
+    'sleep_state': 0,
+    'hibernate_state': 2,
+    'vdda_enabled': 3,
+    'hfo_enabled': 4,
+    'lfo_enabled': 5,
+    'dac_comp_high': 7,
+    'iref_enabled': 8,
+    'field_detector': 9
+}
+
+# Wake-up source bit descriptions
+WU_SOURCE_BITS = {
+    'timeout': 0,
+    'tag_detection': 1,
+    'field_detection': 2,
+    'irq_in_low_pulse': 3,
+    'ss_low_pulse': 4,
+    'lfo_freq': 6  # 2 bits for frequency
+}
+
 def tx_flag(raw: int) -> str:
     flag = '('
     if raw & 0x80 == 0x80:
@@ -119,6 +157,74 @@ def ac_state(raw: int) -> str:
     state += f"{raw&0xf} significant bits in last byte)"
     return state
 
+def parse_wake_up_source(byte_val: int) -> str:
+    """Parse wake-up source configuration byte for Idle command"""
+    lfo_bits = (byte_val >> 6) & 0b11
+    lfo_freq = LFO_FREQ.get(lfo_bits, f'Unknown({lfo_bits})')
+    sources = []
+    if byte_val & (1 << 4):
+        sources.append('SS_pulse')
+    if byte_val & (1 << 3):
+        sources.append('IRQ_IN')
+    if byte_val & (1 << 2):
+        sources.append('FieldDetect')
+    if byte_val & (1 << 1):
+        sources.append('TagDetect')
+    if byte_val & 1:
+        sources.append('Timeout')
+    if not sources:
+        sources.append('None')
+    return f"LFO:{lfo_freq} WU:{'+'.join(sources)}"
+
+def parse_ctrl_res_conf(byte_low: int, byte_high: int) -> str:
+    """Parse control/resume configuration bytes for Idle command"""
+    value = byte_low | (byte_high << 8)
+    states = []
+    if value & 1:
+        states.append('Sleep')
+    if value & (1 << 2):
+        states.append('Hibernate')
+    enabled = []
+    if value & (1 << 3):
+        enabled.append('VDDA')
+    if value & (1 << 4):
+        enabled.append('HFO')
+    if value & (1 << 5):
+        enabled.append('LFO')
+    if value & (1 << 7):
+        enabled.append('DAC_H')
+    if value & (1 << 8):
+        enabled.append('IREF')
+    if value & (1 << 9):
+        enabled.append('FieldDet')
+    result = ''
+    if states:
+        result += f"Mode:{'+'.join(states)} "
+    if enabled:
+        result += f"En:{'+'.join(enabled)}"
+    return result.strip()
+
+def format_idle_params(params: dict) -> str:
+    """Format all Idle command parameters into readable string"""
+    parts = []
+    if 'wakeup_source' in params:
+        parts.append(params['wakeup_source'])
+    if 'enter_ctrl' in params:
+        parts.append(f"Enter:{params['enter_ctrl']}")
+    if 'wu_ctrl' in params:
+        parts.append(f"WU:{params['wu_ctrl']}")
+    if 'leave_ctrl' in params:
+        parts.append(f"Leave:{params['leave_ctrl']}")
+    if 'timing' in params:
+        timing = params['timing']
+        parts.append(f"Period:{timing['period']} OSC:{timing['osc']} DAC:{timing['dac']}")
+    if 'dac_data' in params:
+        dac = params['dac_data']
+        parts.append(f"DAC:{dac['low']:02X}/{dac['high']:02X}")
+    if 'swing_count' in params and 'max_sleep' in params:
+        parts.append(f"Swings:{params['swing_count']} MaxSleep:{params['max_sleep']}")
+    return ' '.join(parts)
+
 class Hla(HighLevelAnalyzer):
     
     def __init__(self):
@@ -138,6 +244,8 @@ class Hla(HighLevelAnalyzer):
             if self.state == ST25R95_DECODER_STATE.GET_CONTROL_BYTE:
                 self.data = ''
                 self.protocol = ''
+                self.idle_params = {}
+                self.idle_data_bytes = []
                 self.flags = '{0:#0{1}x}'.format(miso, 4)
                 self.send = True
                 if mosi == 0x01:
@@ -169,7 +277,18 @@ class Hla(HighLevelAnalyzer):
             elif self.state == ST25R95_DECODER_STATE.GET_LEN:
                 self.data_len += mosi if self.send else miso
                 self.data += '{0:#0{1}x}'.format(self.data_len, 4) + ' '
-                self.state = ST25R95_DECODER_STATE.GET_REG if (self.cmd_resp == 'WrReg' or self.cmd_resp == 'RdReg') else ST25R95_DECODER_STATE.GET_PROTOCOL if self.cmd_resp == 'ProtocolSelect' else ST25R95_DECODER_STATE.GET_DATA
+                if self.send:
+                    if self.cmd_resp == 'WrReg' or self.cmd_resp == 'RdReg':
+                        self.state = ST25R95_DECODER_STATE.GET_REG
+                    elif self.cmd_resp == 'ProtocolSelect':
+                        self.state = ST25R95_DECODER_STATE.GET_PROTOCOL
+                    elif self.cmd_resp == 'Idle':
+                        self.state = ST25R95_DECODER_STATE.GET_IDLE_WU_SOURCE
+                    else:
+                        self.state = ST25R95_DECODER_STATE.GET_DATA
+                else:
+                    if self.last_command == 'Idle':
+                        self.state = ST25R95_DECODER_STATE.GET_IDLE_RESP
             elif self.state == ST25R95_DECODER_STATE.GET_PROTOCOL:
                 self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
                 self.data_cnt += 1
@@ -206,6 +325,70 @@ class Hla(HighLevelAnalyzer):
                         self.protocol += tx_flag(mosi)
                     else:
                         self.protocol += '{0:#0{1}x}'.format(mosi, 4) + ' '
+            # Idle command parameter parsing states
+            elif self.state == ST25R95_DECODER_STATE.GET_IDLE_WU_SOURCE:
+                self.idle_data_bytes.append(mosi)
+                self.idle_params['wakeup_source'] = parse_wake_up_source(mosi)
+                self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
+                self.data_cnt += 1
+                self.state = ST25R95_DECODER_STATE.GET_IDLE_ENTER_CTRL
+            elif self.state == ST25R95_DECODER_STATE.GET_IDLE_ENTER_CTRL:
+                self.idle_data_bytes.append(mosi)
+                self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
+                self.data_cnt += 1
+                if self.data_cnt == 3:  # After 2 bytes of enter_ctrl
+                    self.idle_params['enter_ctrl'] = parse_ctrl_res_conf(self.idle_data_bytes[1], self.idle_data_bytes[2])
+                    self.state = ST25R95_DECODER_STATE.GET_IDLE_WU_CTRL
+            elif self.state == ST25R95_DECODER_STATE.GET_IDLE_WU_CTRL:
+                self.idle_data_bytes.append(mosi)
+                self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
+                self.data_cnt += 1
+                if self.data_cnt == 5:  # After 2 bytes of wu_ctrl
+                    self.idle_params['wu_ctrl'] = parse_ctrl_res_conf(self.idle_data_bytes[3], self.idle_data_bytes[4])
+                    self.state = ST25R95_DECODER_STATE.GET_IDLE_LEAVE_CTRL
+            elif self.state == ST25R95_DECODER_STATE.GET_IDLE_LEAVE_CTRL:
+                self.idle_data_bytes.append(mosi)
+                self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
+                self.data_cnt += 1
+                if self.data_cnt == 7:  # After 2 bytes of leave_ctrl
+                    self.idle_params['leave_ctrl'] = parse_ctrl_res_conf(self.idle_data_bytes[5], self.idle_data_bytes[6])
+                    self.state = ST25R95_DECODER_STATE.GET_IDLE_TIMING
+            elif self.state == ST25R95_DECODER_STATE.GET_IDLE_TIMING:
+                self.idle_data_bytes.append(mosi)
+                self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
+                self.data_cnt += 1
+                if self.data_cnt == 10:  # After timing bytes (wu_period, osc_start, dac_start)
+                    self.idle_params['timing'] = {
+                        'period': self.idle_data_bytes[7],
+                        'osc': self.idle_data_bytes[8],
+                        'dac': self.idle_data_bytes[9]
+                    }
+                    self.state = ST25R95_DECODER_STATE.GET_IDLE_DAC_DATA
+            elif self.state == ST25R95_DECODER_STATE.GET_IDLE_DAC_DATA:
+                self.idle_data_bytes.append(mosi)
+                self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
+                self.data_cnt += 1
+                if self.data_cnt == 12:  # After DAC data bytes
+                    self.idle_params['dac_data'] = {
+                        'low': self.idle_data_bytes[10],
+                        'high': self.idle_data_bytes[11]
+                    }
+                    self.state = ST25R95_DECODER_STATE.GET_IDLE_PARAMS
+            elif self.state == ST25R95_DECODER_STATE.GET_IDLE_PARAMS:
+                self.idle_data_bytes.append(mosi)
+                self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
+                self.data_cnt += 1
+                if self.data_cnt == 14:  # After swing_count and max_sleep
+                    self.idle_params['swing_count'] = self.idle_data_bytes[12]
+                    self.idle_params['max_sleep'] = self.idle_data_bytes[13]
+                    # Format the complete Idle command description
+                    self.cmd_resp = 'Idle (' + format_idle_params(self.idle_params) + ')'
+                    self.state = ST25R95_DECODER_STATE.GET_DATA
+            elif self.state == ST25R95_DECODER_STATE.GET_IDLE_RESP:
+                self.data += '{0:#0{1}x}'.format(miso, 4) + ' '
+                self.data_cnt += 1
+                self.cmd_resp += ' (' + parse_wake_up_source(miso) + ')'
+                self.state = ST25R95_DECODER_STATE.GET_DATA
         elif frame.type == 'disable':
             self.state = ST25R95_DECODER_STATE.START
             bugs = ''
