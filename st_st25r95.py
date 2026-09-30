@@ -174,7 +174,7 @@ def parse_wake_up_source(byte_val: int) -> str:
         sources.append('Timeout')
     if not sources:
         sources.append('None')
-    return f"LFO:{lfo_freq} WU:{'+'.join(sources)}"
+    return f"LFO:{lfo_freq} WU_SRC:{'+'.join(sources)}"
 
 def parse_ctrl_res_conf(byte_low: int, byte_high: int) -> str:
     """Parse control/resume configuration bytes for Idle command"""
@@ -217,12 +217,12 @@ def format_idle_params(params: dict) -> str:
         parts.append(f"Leave:{params['leave_ctrl']}")
     if 'timing' in params:
         timing = params['timing']
-        parts.append(f"Period:{timing['period']} OSC:{timing['osc']} DAC:{timing['dac']}")
+        parts.append(f"WUPeriod:{timing['period']} OSCstart:{timing['osc']} DACstart:{timing['dac']}")
     if 'dac_data' in params:
         dac = params['dac_data']
-        parts.append(f"DAC:{dac['low']:02X}/{dac['high']:02X}")
+        parts.append(f"DACdata:{dac['low']:02X}/{dac['high']:02X}")
     if 'swing_count' in params and 'max_sleep' in params:
-        parts.append(f"Swings:{params['swing_count']} MaxSleep:{params['max_sleep']}")
+        parts.append(f"SwingsCnt:{params['swing_count']} MaxSleep:{params['max_sleep']}")
     return ' '.join(parts)
 
 class Hla(HighLevelAnalyzer):
@@ -289,6 +289,8 @@ class Hla(HighLevelAnalyzer):
                 else:
                     if self.last_command == 'Idle':
                         self.state = ST25R95_DECODER_STATE.GET_IDLE_RESP
+                    else:
+                        self.state = ST25R95_DECODER_STATE.GET_DATA
             elif self.state == ST25R95_DECODER_STATE.GET_PROTOCOL:
                 self.data += '{0:#0{1}x}'.format(mosi, 4) + ' '
                 self.data_cnt += 1
